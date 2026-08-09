@@ -337,3 +337,367 @@ class MergeCapsTests(unittest.TestCase):
                                    history_path=self.hist)
         self.assertEqual(
             snap["caps"]["seven_day"]["used_percentage"], 82)
+
+
+class ProviderScopeTests(unittest.TestCase):
+    """A usage cap belongs to an account, not a machine.
+
+    Live bug, 2026-08-09: one project routed at Alibaba via ANTHROPIC_BASE_URL
+    showed "qwen3.8-max · wk 42%" — the 42% was the DEFAULT account's weekly,
+    borrowed from the shared snapshot, while the vendor's own quota was
+    exhausted and returning 429s. A confident number from the wrong account is
+    worse than no number, so the cap is now scoped per provider.
+    """
+
+    ALIYUN = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="llmeter-provider-")
+        self.addCleanup(shutil.rmtree, d)
+        self.dir = d
+        self.snap = os.path.join(d, "usage-snapshot.json")
+        self.hist = os.path.join(d, "usage-history.jsonl")
+
+    @contextlib.contextmanager
+    def _env(self, base_url):
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_BASE_URL", None)
+        if base_url:
+            env["ANTHROPIC_BASE_URL"] = base_url
+        with mock.patch.dict(os.environ, env, clear=True):
+            yield
+
+    def _run(self, payload):
+        from llmeter import statusline
+        out = io.StringIO()
+        with mock.patch.object(core, "DIR", self.dir), \
+             mock.patch.object(core, "SNAPSHOT_PATH", self.snap), \
+             mock.patch.object(core, "HISTORY_PATH", self.hist), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out):
+            statusline.main()
+        return out.getvalue().strip()
+
+    # --- provider_key ---------------------------------------------------
+    def test_unset_or_blank_base_url_is_the_default_provider(self):
+        for value in (None, "", "   "):
+            with self._env(value):
+                self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
+
+    def test_anthropics_own_host_is_the_default_provider(self):
+        # Setting the canonical base URL explicitly must not split the cap.
+        with self._env("https://api.anthropic.com"):
+            self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
+
+    def test_third_party_host_is_its_own_provider(self):
+        # Key is "<readable label>#<digest>": the label carries the canonical
+        # URL so a human can read it, the digest makes identity injective.
+        with self._env(self.ALIYUN):
+            key = core.provider_key()
+        self.assertTrue(key.startswith(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic#"),
+            key)
+
+    def test_provider_key_never_raises_on_junk(self):
+        for junk in ("not a url", "http://", "://///", "http://[oops"):
+            with self._env(junk):
+                self.assertIsInstance(core.provider_key(), str)
+
+    def test_case_does_not_split_a_provider(self):
+        with self._env("HTTPS://Gateway.Example.COM/v1"):
+            first = core.provider_key()
+        with self._env("https://gateway.example.com/v1"):
+            self.assertEqual(core.provider_key(), first)
+
+    # --- snapshot paths -------------------------------------------------
+    def test_default_provider_keeps_the_original_filename(self):
+        # Existing consumers read usage-snapshot.json; that must not move.
+        with self._env(None), mock.patch.object(core, "SNAPSHOT_PATH", self.snap):
+            self.assertEqual(core.snapshot_path_for(), self.snap)
+
+    def test_third_party_gets_its_own_file(self):
+        with self._env(self.ALIYUN), mock.patch.object(core, "DIR", self.dir):
+            path = core.snapshot_path_for()
+        self.assertNotEqual(path, self.snap)
+        self.assertTrue(os.path.basename(path).startswith("usage-snapshot."))
+        self.assertTrue(path.endswith(".json"))
+
+    def test_provider_slug_is_filesystem_safe(self):
+        slug = core._provider_slug("Weird/Host:8080\\..")
+        self.assertNotIn("/", slug)
+        self.assertNotIn("\\", slug)
+        self.assertNotIn(":", slug)
+        self.assertTrue(slug)
+
+    # --- the regression --------------------------------------------------
+    def test_third_party_session_does_not_borrow_the_default_account_cap(self):
+        with self._env(None):
+            seeded = self._run(PAYLOAD)
+        self.assertIn("wk 10%", seeded)  # default account persisted its cap
+
+        with self._env(self.ALIYUN):
+            line = self._run({"model": {"display_name": "qwen3.8-max"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("qwen3.8-max", line)
+        self.assertIn("ctx 16%", line)
+        self.assertNotIn("wk", line)  # the whole point: no borrowed number
+
+    def test_same_provider_fallback_still_works(self):
+        # The cross-window fallback is the feature; only cross-PROVIDER is wrong.
+        with self._env(None):
+            self._run(PAYLOAD)
+            line = self._run({"model": {"display_name": "Opus 4.8"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("wk 10%", line)
+
+    def test_third_party_caps_never_land_in_the_default_snapshot(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        before = _json(self.snap)
+
+        vendor = json.loads(json.dumps(PAYLOAD))
+        vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+        vendor["model"]["display_name"] = "qwen3.8-max"
+        with self._env(self.ALIYUN):
+            self._run(vendor)
+
+        after = _json(self.snap)
+        self.assertEqual(after["caps"]["seven_day"]["used_percentage"],
+                         before["caps"]["seven_day"]["used_percentage"])
+        self.assertEqual(after["model"], "Fable 5")
+
+    def test_each_provider_keeps_its_own_cap(self):
+        vendor = json.loads(json.dumps(PAYLOAD))
+        vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+        with self._env(self.ALIYUN):
+            self._run(vendor)
+            line = self._run({"model": {"display_name": "qwen3.8-max"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("wk 99%", line)  # its OWN number, not the default's
+
+    def test_snapshot_and_history_record_the_provider(self):
+        with self._env(self.ALIYUN):
+            expected = core.provider_key()
+        with self._env(self.ALIYUN):
+            self._run(PAYLOAD)
+            with mock.patch.object(core, "DIR", self.dir), \
+                 mock.patch.object(core, "HISTORY_PATH", self.hist):
+                snap_path = core.snapshot_path_for()
+                hist_path = core.history_path_for()
+        self.assertEqual(_json(snap_path)["provider"], expected)
+        row = json.loads(_lines(hist_path)[-1])
+        self.assertEqual(row["provider"], expected)
+
+    # --- codex review round 1 -------------------------------------------
+    def test_same_host_different_routes_are_different_providers(self):
+        # [P1] A gateway multiplexes upstreams off one hostname. Host-only
+        # identity collided them, so A's cap surfaced as B's fallback.
+        with self._env("https://gateway.example.com/provider-a"):
+            a = core.provider_key()
+            a_path = core.snapshot_path_for()
+        with self._env("https://gateway.example.com/provider-b"):
+            b = core.provider_key()
+            b_path = core.snapshot_path_for()
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a_path, b_path)
+
+    def test_port_is_part_of_the_identity(self):
+        with self._env("https://gw.example.com:8443/v1"):
+            a = core.provider_key()
+        with self._env("https://gw.example.com:9443/v1"):
+            self.assertNotEqual(core.provider_key(), a)
+
+    def test_trailing_slash_and_fqdn_dot_do_not_split_a_provider(self):
+        with self._env("https://GW.Example.COM./v1/"):
+            a = core.provider_key()
+        with self._env("https://gw.example.com/v1"):
+            self.assertEqual(core.provider_key(), a)
+
+    def test_gateway_route_caps_stay_separate_end_to_end(self):
+        route_a = "https://gateway.example.com/provider-a"
+        route_b = "https://gateway.example.com/provider-b"
+        with self._env(route_a):
+            self._run(PAYLOAD)  # A persists wk 10%
+        with self._env(route_b):
+            line = self._run({"model": {"display_name": "B"},
+                              "context_window": {"used_percentage": 5}})
+        self.assertNotIn("wk", line)
+
+    def test_explicit_path_cannot_bypass_provider_isolation(self):
+        # [P2] read_snapshot(SNAPSHOT_PATH) reached the default account's file
+        # regardless of who was asking. The stamped provider is now verified.
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            self.assertIsNone(core.read_snapshot(self.snap, max_age_secs=None))
+        # ...and an explicit opt-out still allows deliberate inspection.
+        with self._env(self.ALIYUN):
+            forced = core.read_snapshot(self.snap, max_age_secs=None,
+                                        provider=False)
+        self.assertEqual(forced["caps"]["seven_day"]["used_percentage"], 10.0)
+
+    def test_legacy_snapshot_without_provider_reads_as_default_account(self):
+        # Migration: files written before this field existed were the default.
+        with self._env(None):
+            self._run(PAYLOAD)
+        legacy = _json(self.snap)
+        legacy.pop("provider", None)
+        with open(self.snap, "w") as f:
+            json.dump(legacy, f)
+        with self._env(None):
+            self.assertIsNotNone(core.read_snapshot(self.snap,
+                                                    max_age_secs=None))
+        with self._env(self.ALIYUN):
+            self.assertIsNone(core.read_snapshot(self.snap, max_age_secs=None))
+
+    def test_history_is_per_provider(self):
+        # [P2] A consumer predating this change must not read a third party's
+        # rows as the default account's cap changes.
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            vendor = json.loads(json.dumps(PAYLOAD))
+            vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+            self._run(vendor)
+        rows = [json.loads(l) for l in _lines(self.hist)]
+        self.assertTrue(rows)
+        for row in rows:  # default history stays purely default-account
+            self.assertEqual(row.get("provider"), core.DEFAULT_PROVIDER)
+
+    def test_slug_is_bounded_and_collision_free(self):
+        long_host = ".".join(["averyverylongsubdomainlabel"] * 12) + ".example.com"
+        slug = core._provider_slug(long_host)
+        # What actually matters is that the FILENAME stays inside the 255-byte
+        # limit every common filesystem enforces, so persistence can't fail.
+        with mock.patch.object(core, "DIR", self.dir):
+            name = os.path.basename(core.snapshot_path_for(long_host))
+        self.assertLess(len(name.encode("utf-8")), 255)
+        # Two hosts sharing a sanitised prefix must not share a file.
+        a = core._provider_slug("a" * 60 + "-one")
+        b = core._provider_slug("a" * 60 + "-two")
+        self.assertNotEqual(a, b)
+
+    def test_environment_switch_round_trip_restores_the_cap(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            self._run({"model": {"display_name": "qwen3.8-max"},
+                       "context_window": {"used_percentage": 3}})
+        with self._env(None):  # back to the default account
+            line = self._run({"model": {"display_name": "Opus 4.8"},
+                              "context_window": {"used_percentage": 9}})
+        self.assertIn("wk 10%", line)
+
+    def test_two_distinct_third_parties_do_not_share(self):
+        with self._env("https://vendor-one.example.com"):
+            self._run(PAYLOAD)
+        with self._env("https://vendor-two.example.com"):
+            line = self._run({"model": {"display_name": "two"},
+                              "context_window": {"used_percentage": 4}})
+        self.assertNotIn("wk", line)
+
+    def test_persisted_fields_are_exactly_the_documented_set(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        allowed = set(core._SNAPSHOT_FIELDS) | set(core._STAMPED_FIELDS)
+        self.assertTrue(set(_json(self.snap)).issubset(allowed),
+                        "a field reached disk that is on no allowlist")
+
+    # --- codex review round 2: identity must be injective ----------------
+    def _keys(self, *urls):
+        out = []
+        for u in urls:
+            with self._env(u):
+                out.append(core.provider_key())
+        return out
+
+    def test_scheme_is_part_of_the_identity(self):
+        a, b = self._keys("http://gateway.example.com/v1",
+                          "https://gateway.example.com/v1")
+        self.assertNotEqual(a, b)
+
+    def test_query_is_part_of_the_identity(self):
+        # A multi-tenant gateway may route by query string.
+        a, b = self._keys("https://gw.example.com/v1?account=a",
+                          "https://gw.example.com/v1?account=b")
+        self.assertNotEqual(a, b)
+
+    def test_userinfo_is_part_of_the_identity(self):
+        a, b = self._keys("https://alice:token-a@gw.example.com/v1",
+                          "https://bob:token-b@gw.example.com/v1")
+        self.assertNotEqual(a, b)
+
+    def test_userinfo_never_reaches_the_readable_key_or_disk(self):
+        # llmeter's promise is that no credential lands on disk. Userinfo may
+        # only influence the one-way digest.
+        with self._env("https://alice:s3cret-token@gw.example.com/v1"):
+            key = core.provider_key()
+            self._run(PAYLOAD)
+            with mock.patch.object(core, "DIR", self.dir):
+                path = core.snapshot_path_for()
+        self.assertNotIn("s3cret-token", key)
+        self.assertNotIn("alice", key)
+        self.assertNotIn("s3cret-token", path)
+        self.assertNotIn("s3cret-token", _read(path))
+
+    def test_ipv6_literal_and_port_cannot_blur(self):
+        a, b = self._keys("https://[2001:db8::1]:8443/v1",
+                          "https://[2001:db8::1:8443]/v1")
+        self.assertNotEqual(a, b)
+
+    def test_default_port_does_not_split_a_provider(self):
+        a, b = self._keys("https://gw.example.com/v1",
+                          "https://gw.example.com:443/v1")
+        self.assertEqual(a, b)
+        c, d = self._keys("http://gw.example.com/v1",
+                          "http://gw.example.com:80/v1")
+        self.assertEqual(c, d)
+
+    def test_non_default_port_still_splits(self):
+        a, b = self._keys("https://gw.example.com/v1",
+                          "https://gw.example.com:8443/v1")
+        self.assertNotEqual(a, b)
+
+    def test_scheme_variants_do_not_share_a_cap_end_to_end(self):
+        with self._env("https://gw.example.com/v1"):
+            self._run(PAYLOAD)
+        with self._env("http://gw.example.com/v1"):
+            line = self._run({"model": {"display_name": "other"},
+                              "context_window": {"used_percentage": 5}})
+        self.assertNotIn("wk", line)
+
+    # --- codex review round 3 --------------------------------------------
+    def test_query_secret_never_reaches_disk(self):
+        # A query string routinely carries credentials. It must still change
+        # identity, but must not appear in the key, the filename or the file.
+        url = "https://gw.example.com/v1?api_key=s3cret-value"
+        with self._env(url):
+            key = core.provider_key()
+            self._run(PAYLOAD)
+            with mock.patch.object(core, "DIR", self.dir):
+                path = core.snapshot_path_for()
+                hist = core.history_path_for()
+        for blob in (key, path, _read(path), _read(hist)):
+            self.assertNotIn("s3cret-value", blob)
+            self.assertNotIn("api_key", blob)
+
+    def test_query_still_separates_accounts(self):
+        a, b = self._keys("https://gw.example.com/v1?account=a",
+                          "https://gw.example.com/v1?account=b")
+        self.assertNotEqual(a, b)
+
+    def test_hostile_env_values_never_raise(self):
+        hostile = ["https://" + "\udcff" + ".example/v1", "https://gw.example:bad",
+                   "\udcff", "https://[oops", "://", "%%%", "https://" + "x" * 5000]
+        for value in hostile:
+            with self._env(value):
+                key = core.provider_key()
+                self.assertIsInstance(key, str)
+                self.assertTrue(key)
+        self.assertIsInstance(core._provider_slug("\udcff"), str)
+
+    def test_hostile_env_value_still_persists(self):
+        # Fail-soft must not mean "silently stop recording".
+        with self._env("https://" + "\udcff" + ".example/v1"):
+            line = self._run(PAYLOAD)
+        self.assertIn("wk 10%", line)
