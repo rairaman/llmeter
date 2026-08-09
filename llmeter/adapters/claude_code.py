@@ -68,6 +68,8 @@ def _context_window_overrides():
     overrides = {
         # Custom models routed through a proxy: Claude Code reports 200k, the
         # real window is larger. Add yours here, or set LLMETER_CONTEXT_WINDOWS.
+        "qwen3.8-max": 1_000_000,
+        # Retired by Alibaba 2026-08-05; kept so replayed old sessions still size right.
         "qwen3.8-max-preview": 1_000_000,
     }
     for chunk in os.environ.get("LLMETER_CONTEXT_WINDOWS", "").split(","):
