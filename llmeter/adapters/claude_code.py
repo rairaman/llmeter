@@ -71,6 +71,13 @@ def _context_window_overrides():
         "qwen3.8-max": 1_000_000,
         # Retired by Alibaba 2026-08-05; kept so replayed old sessions still size right.
         "qwen3.8-max-preview": 1_000_000,
+        # Moonshot Kimi. Sizes per platform.kimi.ai/docs/guide/claude-code-kimi
+        # (checked 2026-08-10). The "[1m]" spelling is the model id used on the
+        # pay-as-you-go endpoint; the subscription endpoint takes the bare id.
+        "kimi-k3": 1_048_576,
+        "kimi-k3[1m]": 1_048_576,
+        "kimi-k2.7-code": 262_144,
+        "kimi-k2.7-code-highspeed": 262_144,
     }
     for chunk in os.environ.get("LLMETER_CONTEXT_WINDOWS", "").split(","):
         if "=" not in chunk:

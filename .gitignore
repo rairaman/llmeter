@@ -17,3 +17,6 @@ usage-snapshot.json
 usage-history.jsonl
 *.llmeter-bak-*
 *.llmeter-tmp
+
+# git worktrees live in the project, never committed
+worktrees/

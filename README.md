@@ -85,6 +85,70 @@ reports a cap of its own. That is deliberate. A cap borrowed from your
 Anthropic account, displayed under a third-party model's name, is a confident
 wrong number — and this tool exists to show you the real one.
 
+#### Working examples
+
+Per-project, in that project's `.claude/settings.local.json`. `apiKeyHelper`
+names an executable and uses whatever it prints, so the key lives in a
+`chmod 700` script outside the repo instead of in a tracked file.
+
+Alibaba Qwen:
+
+```json
+{
+  "apiKeyHelper": "/Users/you/.claude/qwen-key.sh",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://token-plan.<region>.maas.aliyuncs.com/apps/anthropic",
+    "ANTHROPIC_MODEL": "qwen3.8-max"
+  }
+}
+```
+
+Moonshot Kimi:
+
+```json
+{
+  "apiKeyHelper": "/Users/you/.claude/kimi-key.sh",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+    "ANTHROPIC_MODEL": "kimi-k3"
+  }
+}
+```
+
+Three things that trip people up:
+
+1. **The endpoint has to match the key type.** Moonshot sells two products with
+   two key types and two endpoints, and swapping them returns `401 Invalid
+   Authentication` — which reads like a bad key rather than a wrong URL. A
+   **Kimi for Coding** subscription key works only against
+   `https://api.kimi.com/coding`; a **pay-as-you-go platform** key (from
+   `platform.moonshot.ai`) works only against
+   `https://api.moonshot.ai/anthropic`. The official Claude Code guide documents
+   the pay-as-you-go path only, so a subscription key following it fails.
+2. **Set the tier variables too.** With only `ANTHROPIC_MODEL` set, background
+   work (title generation, summarization) and subagents still request Claude
+   model names the vendor doesn't recognise, and fail quietly. Set
+   `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+   `ANTHROPIC_DEFAULT_HAIKU_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` to the same
+   model.
+3. **`settings.local.json` is read at startup.** Restart Claude Code in that
+   project after editing it.
+
+#### Context window for custom models
+
+Claude Code only knows the window of models in its own table and falls back to
+**200k** for everything else, so a 1M-context model reads about 5x too full.
+llmeter substitutes the real window and recomputes the percentage. Built in:
+`qwen3.8-max`, `kimi-k3`, `kimi-k2.7-code`.
+
+Add your own without editing the source:
+
+```bash
+export LLMETER_CONTEXT_WINDOWS="my-model=1048576,other-model=262144"
+```
+
+Malformed entries are ignored rather than breaking the status line.
+
 ## Uninstall
 
 ```bash

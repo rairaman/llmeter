@@ -70,6 +70,34 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(r["context_tokens"])
         self.assertIsNone(r["context_window_size"])
 
+    def test_known_custom_models_override_the_200k_fallback(self):
+        # Claude Code reports 200k for any model outside its own table, so a
+        # 1M-context model reads 5x too full. Seen live 2026-08-10: a kimi-k3
+        # session showed "ctx 20% (41k/200k)" when the real window is 1M.
+        for model_id, window in (("kimi-k3", 1_048_576),
+                                 ("kimi-k3[1m]", 1_048_576),
+                                 ("kimi-k2.7-code", 262_144),
+                                 ("qwen3.8-max", 1_000_000)):
+            r = claude_code.parse({
+                "model": {"display_name": model_id},
+                "context_window": {"used_percentage": 20,
+                                   "total_input_tokens": 41_000,
+                                   "context_window_size": 200_000}})
+            self.assertEqual(r["context_window_size"], window, model_id)
+            # Percentage is recomputed from the absolute tokens, so the line
+            # stays internally consistent rather than keeping the stale 20%.
+            self.assertAlmostEqual(r["context_pct"], 41_000 * 100.0 / window,
+                                   places=6, msg=model_id)
+
+    def test_unknown_model_keeps_the_reported_window(self):
+        r = claude_code.parse({
+            "model": {"display_name": "some-model-we-never-heard-of"},
+            "context_window": {"used_percentage": 20,
+                               "total_input_tokens": 41_000,
+                               "context_window_size": 200_000}})
+        self.assertEqual(r["context_window_size"], 200_000)
+        self.assertEqual(r["context_pct"], 20)
+
     def test_parse_hostile_shapes_never_raise(self):
         for bad in ({}, {"model": "a-string", "rate_limits": 5}, {"context_window": 3}):
             r = claude_code.parse(bad)
