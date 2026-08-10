@@ -80,10 +80,29 @@ If a project points Claude Code at another endpoint with `ANTHROPIC_BASE_URL`
 is spending a **different account's** quota. llmeter keeps each provider's
 usage in its own file and never lets one stand in for another.
 
-The visible effect: such a session shows `ctx` but no `wk` until that endpoint
-reports a cap of its own. That is deliberate. A cap borrowed from your
-Anthropic account, displayed under a third-party model's name, is a confident
-wrong number — and this tool exists to show you the real one.
+The visible effect: such a session shows **`model · ctx% · $spend`** rather than
+`wk`. A cap borrowed from your Anthropic account and displayed under a
+third-party model's name is a confident wrong number, and this tool exists to
+show you the real one.
+
+**There is no weekly % available for a vendor session, and it is not a gap
+llmeter can close.** Measured 2026-08-10 against Claude Code 2.1.226:
+
+- 58 consecutive status-line payloads captured from live Kimi and Qwen sessions
+  carried **no `rate_limits` key at all**. Anthropic sessions carry it.
+- The vendor returned **no rate-limit response headers**.
+- **No usage endpoint** answered on the vendor's API (six candidate paths tried).
+- Claude Code's own `/usage` panel calls `GET /api/oauth/usage`, an OAuth call
+  scoped to the **Anthropic subscription**. It ignores `ANTHROPIC_BASE_URL`.
+
+That last point is the one that misleads: if you read `/usage` during a Kimi or
+Qwen session and think the plan figures are that vendor's, they are not. They
+are your Claude plan's.
+
+So llmeter shows the usage signal that *is* real for a metered session — the
+running spend Claude Code reports in the payload. On the default provider,
+where `wk` is the meaningful number and a dollar figure would be noise, no
+spend is shown.
 
 #### Working examples
 

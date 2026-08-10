@@ -98,6 +98,56 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(r["context_window_size"], 200_000)
         self.assertEqual(r["context_pct"], 20)
 
+    def test_third_party_session_shows_spend_instead_of_a_cap(self):
+        # A vendor session can never show wk: Claude Code fetches plan
+        # utilization only for the Anthropic subscription and forwards no cap
+        # in the payload (57/57 payloads from a live Kimi session, 2026-08-10).
+        # cost.total_cost_usd DOES arrive, so it fills the empty slot.
+        payload = {"model": {"display_name": "kimi-k3"},
+                   "context_window": {"used_percentage": 20,
+                                      "total_input_tokens": 40_400,
+                                      "context_window_size": 200_000},
+                   "cost": {"total_cost_usd": 0.06335}}
+        with mock.patch.dict(os.environ,
+                             {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding"}):
+            r = claude_code.parse(payload)
+        self.assertEqual(r["cost"], {"session_usd": 0.06335})
+        self.assertEqual(r["caps"], {})
+        self.assertEqual(core.format_line(r), "kimi-k3 · ctx 4% (40k/1M) · $0.06")
+
+    def test_default_provider_keeps_the_cap_and_shows_no_spend(self):
+        # On a subscription, wk is the meaningful number and a dollar figure
+        # would be noise — so cost stays None there.
+        payload = {"model": {"display_name": "Opus 5 (1M context)"},
+                   "context_window": {"used_percentage": 6},
+                   "cost": {"total_cost_usd": 4.20}}
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": ""}):
+            r = claude_code.parse(payload)
+        self.assertIsNone(r["cost"])
+        self.assertNotIn("$", core.format_line(r))
+
+    def test_fresh_third_party_window_shows_zero_not_a_stale_total(self):
+        # 0.0 must still produce a cost dict. If it returned None, format_line
+        # would fall back to the persisted snapshot and print the PREVIOUS
+        # session's total under a brand-new session — a confident wrong number.
+        with mock.patch.dict(os.environ,
+                             {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding"}):
+            r = claude_code.parse({"model": {"display_name": "kimi-k3"},
+                                   "cost": {"total_cost_usd": 0.0}})
+        self.assertEqual(r["cost"], {"session_usd": 0.0})
+        stale = {"cost": {"session_usd": 9.99}}
+        self.assertIn("$0.00", core.format_line(r, stale))
+        self.assertNotIn("9.99", core.format_line(r, stale))
+
+    def test_spend_ignores_junk_cost_shapes(self):
+        with mock.patch.dict(os.environ,
+                             {"ANTHROPIC_BASE_URL": "https://api.kimi.com/coding"}):
+            for bad in ({"cost": {"total_cost_usd": "1.00"}},
+                        {"cost": {"total_cost_usd": True}},
+                        {"cost": {"total_cost_usd": -1}},
+                        {"cost": "free"}, {"cost": None}, {}):
+                self.assertIsNone(claude_code.parse(bad)["cost"], bad)
+
     def test_parse_hostile_shapes_never_raise(self):
         for bad in ({}, {"model": "a-string", "rate_limits": 5}, {"context_window": 3}):
             r = claude_code.parse(bad)

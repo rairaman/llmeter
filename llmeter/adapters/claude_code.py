@@ -89,6 +89,40 @@ def _context_window_overrides():
     return overrides
 
 
+def _session_spend(data):
+    """Session cost, but only for a session routed to a third-party endpoint.
+
+    Such a session can never show ``wk``. Claude Code fetches plan utilization
+    only for the Anthropic subscription (``GET /api/oauth/usage``, an OAuth
+    call that ignores ``ANTHROPIC_BASE_URL``) and forwards no cap of any kind
+    in the status-line payload. Measured 2026-08-10 on Claude Code 2.1.226: 57
+    consecutive payloads from a live Kimi session carried no ``rate_limits``
+    key at all; the vendor returned no rate-limit response headers; and no
+    usage endpoint answered on that vendor's API. So the number is not being
+    dropped by llmeter, it never arrives.
+
+    ``cost.total_cost_usd`` does arrive, and for a metered vendor session it is
+    the usage signal that matters. Rendered as ``$N.NN`` in the slot ``wk``
+    cannot fill (see ``core.format_line``).
+
+    Left as None on the default provider, where spend is not the meaningful
+    number on a subscription and ``wk`` is the real signal. Returns a value for
+    0.0 as well, so a fresh window shows an honest ``$0.00`` rather than
+    falling back to the previous session's total.
+    """
+    try:
+        if core.provider_key() == core.DEFAULT_PROVIDER:
+            return None
+    except Exception:  # never break the status line over provider detection
+        return None
+    spend = core.dget(data, "cost").get("total_cost_usd")
+    if isinstance(spend, bool) or not isinstance(spend, (int, float)):
+        return None
+    if spend < 0:
+        return None
+    return {"session_usd": spend}
+
+
 def parse(data):
     """Claude Code statusLine payload -> normalized Reading (see core).
 
@@ -111,7 +145,7 @@ def parse(data):
         "context_tokens": cw.get("total_input_tokens"),
         "context_window_size": cw.get("context_window_size"),
         "caps": _clean_caps(data.get("rate_limits")),
-        "cost": None,
+        "cost": _session_spend(data),
         "session_id": data.get("session_id"),
     }
     # Custom-model context-window correction. Claude Code only knows the
