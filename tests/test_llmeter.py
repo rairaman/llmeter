@@ -5,6 +5,7 @@ Run:  python3 -m unittest discover -s tests  (from the repo root)
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -33,6 +34,20 @@ def _json(path):
     with open(path) as f:
         return json.load(f)
 
+
+def _segment(line, label):
+    """The status line part starting with ``label``, or None. Lets a test
+    assert a whole segment exactly, so a stray weekday or a changed suffix
+    fails rather than sliding past a substring check."""
+    return next((p for p in line.split(" · ") if p.startswith(label + " ")), None)
+
+
+def _iso(epoch):
+    """The same instant as ``epoch``, written the other way the host may send
+    it. Never hardcode a clock string: the assertion has to hold in any zone."""
+    return datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc).isoformat()
+
 # A representative Claude Code statusLine payload (Pro/Max, mid-session).
 PAYLOAD = {
     "session_id": "s-1",
@@ -51,6 +66,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(r["source"], "claude-code")
         self.assertEqual(r["model"], "Fable 5")
         self.assertEqual(r["context_pct"], 34.5)
+        self.assertEqual(r["caps"]["five_hour"]["used_percentage"], 22.0)
         self.assertEqual(r["caps"]["seven_day"]["used_percentage"], 10.0)
         self.assertIsNone(r["cost"])
 
@@ -196,7 +212,9 @@ class HarvestTests(unittest.TestCase):
     def test_writes_snapshot_and_history(self):
         snap = self._write(PAYLOAD)
         self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 10.0)
+        self.assertEqual(snap["caps"]["five_hour"]["used_percentage"], 22.0)
         on_disk = _json(self.snap)
+        self.assertEqual(on_disk["caps"]["five_hour"]["resets_at"], 1782050340)
         self.assertEqual(on_disk["model"], "Fable 5")
         self.assertEqual(on_disk["context_pct"], 34.5)
         self.assertEqual(on_disk["source"], "claude-code")
@@ -249,6 +267,47 @@ class RenderTests(unittest.TestCase):
         self.assertIn("wk 10%", line)
         self.assertIn("resets", line)
 
+    def test_format_line_shows_the_five_hour_window(self):
+        # The session limit is the one you actually hit mid-afternoon, and
+        # Claude Code has always sent it — only the render dropped it.
+        line = core.format_line(claude_code.parse(PAYLOAD))
+        clock = datetime.datetime.fromtimestamp(1782050340).strftime("%H:%M")
+        # Whole-segment equality, so a stray weekday fails: a 5-hour reset
+        # always lands today and the clock time alone says it.
+        self.assertEqual(_segment(line, "5h"),
+                         "5h 22% (resets {})".format(clock))
+        self.assertLess(line.index("ctx"), line.index("5h"))
+        self.assertLess(line.index("5h"), line.index("wk"))
+
+    def test_format_line_renders_each_window_on_its_own(self):
+        five = core.format_line(
+            {"caps": {"five_hour": {"used_percentage": 22.0,
+                                    "resets_at": 1782050340}}})
+        self.assertIn("5h 22%", five)
+        self.assertNotIn("wk", five)
+        week = core.format_line(
+            {"caps": {"seven_day": {"used_percentage": 10.0,
+                                    "resets_at": 1782518400}}})
+        self.assertIn("wk 10%", week)
+        self.assertNotIn("5h", week)
+
+    def test_format_line_missing_reset_time(self):
+        self.assertEqual(
+            core.format_line({"caps": {"five_hour": {"used_percentage": 22.0}}}),
+            "5h 22% (resets ?)")
+
+    def test_format_line_hostile_cap_windows(self):
+        # The host owns this schema. Anything that is not a real percentage
+        # suppresses the segment rather than rendering a confident wrong
+        # number — True in particular, which isinstance(x, int) waves through.
+        for caps in ({"five_hour": 5}, {"five_hour": None}, {"five_hour": []},
+                     {"five_hour": {"used_percentage": True}},
+                     {"five_hour": {"used_percentage": "22"}},
+                     {"five_hour": {"used_percentage": None}},
+                     {"seven_day": {"used_percentage": True}}):
+            self.assertEqual(
+                core.format_line({"model": "M", "caps": caps}), "M", caps)
+
     def test_format_line_absolute_tokens(self):
         payload = {"model": {"display_name": "Fable 5"},
                    "context_window": {"used_percentage": 20,
@@ -269,6 +328,43 @@ class RenderTests(unittest.TestCase):
                         (200_000, "200k"), (1_000_000, "1M"),
                         (1_500_000, "1.5M")):
             self.assertEqual(core.fmt_tokens(n), want)
+
+    def test_reset_epoch_parses_both_wire_forms(self):
+        # resets_at arrives as epoch seconds OR an ISO string, and the two can
+        # name the SAME instant — so the parsed epoch, not the wire type, is
+        # what identifies a window.
+        stamp = 1782050340
+        self.assertEqual(core._reset_epoch(stamp), float(stamp))
+        self.assertEqual(core._reset_epoch(_iso(stamp)), float(stamp))
+        # A naive ISO string is local time, exactly as fmt_reset always read it.
+        naive = "2026-06-21T14:39:00"
+        self.assertEqual(
+            core._reset_epoch(naive),
+            datetime.datetime.fromisoformat(naive).astimezone().timestamp())
+
+    def test_reset_epoch_rejects_junk_and_bools(self):
+        # JSON true is not epoch 1. isinstance(True, int) is the trap.
+        for bad in (True, False, None, "soon", "", [], {}):
+            self.assertIsNone(core._reset_epoch(bad), bad)
+
+    def test_fmt_reset_default_format_is_unchanged(self):
+        stamp = 1782050340
+        self.assertEqual(
+            core.fmt_reset(stamp),
+            datetime.datetime.fromtimestamp(stamp).strftime("%a %H:%M"))
+        self.assertEqual(core.fmt_reset(_iso(stamp)), core.fmt_reset(stamp))
+
+    def test_fmt_reset_honours_an_explicit_format(self):
+        stamp = 1782050340
+        self.assertEqual(
+            core.fmt_reset(stamp, "%H:%M"),
+            datetime.datetime.fromtimestamp(stamp).strftime("%H:%M"))
+        self.assertEqual(core.fmt_reset(_iso(stamp), "%H:%M"),
+                         core.fmt_reset(stamp, "%H:%M"))
+
+    def test_fmt_reset_junk_and_bools_render_a_question_mark(self):
+        for bad in (True, False, None, "soon", [], {}):
+            self.assertEqual(core.fmt_reset(bad), "?", bad)
 
     def test_format_line_fail_soft(self):
         self.assertEqual(core.format_line({}, None), "llmeter")
@@ -302,6 +398,7 @@ class RenderTests(unittest.TestCase):
         line = core.format_line(no_caps, snap)
         self.assertIn("Opus 4.8", line)
         self.assertIn("ctx 16%", line)
+        self.assertIn("5h 22%", line)
         self.assertIn("wk 10%", line)
 
 
@@ -325,6 +422,7 @@ class MainTests(unittest.TestCase):
     def test_main_harvests_and_prints(self):
         line = self._run(PAYLOAD)
         self.assertIn("Fable 5", line)
+        self.assertIn("5h 22%", line)
         self.assertIn("wk 10%", line)
         self.assertTrue(os.path.exists(self.snap))
 
@@ -334,6 +432,7 @@ class MainTests(unittest.TestCase):
                           "context_window": {"used_percentage": 16}})
         self.assertIn("Opus 4.8", line)
         self.assertIn("ctx 16%", line)
+        self.assertIn("5h 22%", line)  # both windows ride the cache
         self.assertIn("wk 10%", line)  # from the cross-window cache
 
     def test_main_invalid_stdin_still_prints(self):
@@ -382,8 +481,7 @@ class MergeCapsTests(unittest.TestCase):
         self._write(82)
         self._write(58)
         self._write(76)
-        lines = open(self.hist).read().strip().splitlines()
-        self.assertEqual(len(lines), 1)  # only the first real value logged
+        self.assertEqual(len(_lines(self.hist)), 1)  # only the first value logged
 
     def test_new_window_wins_even_if_lower(self):
         self._write(82, resets=1783468800)
@@ -415,6 +513,71 @@ class MergeCapsTests(unittest.TestCase):
                                    history_path=self.hist)
         self.assertEqual(
             snap["caps"]["seven_day"]["used_percentage"], 82)
+
+    # --- window identity is the PARSED instant, not the wire type ---------
+    # A weekly window rolls once a week, so the gaps below rarely bit. A
+    # 5-hour window rolls five times a day, so each one is a stuck meter
+    # within hours. These use five_hour to say which window they protect.
+
+    def _win(self, pct, resets="absent"):
+        win = {"used_percentage": pct}
+        if resets != "absent":
+            win["resets_at"] = resets
+        return {"five_hour": win}
+
+    def _merged(self, old, new):
+        merged = core._merge_caps(old, new)
+        return merged["five_hour"]["used_percentage"]
+
+    def test_two_iso_resets_do_not_ratchet_the_meter(self):
+        # The regression. Two ISO strings failed the numeric-type check and
+        # fell through to max-wins, so the meter kept its high-water mark for
+        # ever and a fresh window read as nearly exhausted.
+        old = self._win(88, _iso(1782050340))
+        new = self._win(4, _iso(1782050340 + 5 * 3600))
+        self.assertEqual(self._merged(old, new), 4)
+        self.assertEqual(self._merged(new, old), 4)  # order must not matter
+
+    def test_iso_same_window_keeps_max(self):
+        stamp = _iso(1782050340)
+        self.assertEqual(self._merged(self._win(88, stamp),
+                                      self._win(41, stamp)), 88)
+
+    def test_epoch_and_equivalent_iso_are_one_window(self):
+        stamp = 1782050340
+        self.assertEqual(self._merged(self._win(88, stamp),
+                                      self._win(41, _iso(stamp))), 88)
+        self.assertEqual(self._merged(self._win(41, _iso(stamp)),
+                                      self._win(88, stamp)), 88)
+
+    def test_later_iso_beats_an_earlier_epoch(self):
+        # Mixed forms handed the win to whichever side happened to be numeric,
+        # so a newer ISO-identified window lost to an older epoch one.
+        stamp = 1782050340
+        self.assertEqual(self._merged(self._win(88, stamp),
+                                      self._win(2, _iso(stamp + 5 * 3600))), 2)
+        self.assertEqual(self._merged(self._win(2, _iso(stamp + 5 * 3600)),
+                                      self._win(88, stamp)), 2)
+
+    def test_unidentified_window_loses_to_an_identified_one(self):
+        for junk in ("absent", None, "soon", True, False, []):
+            self.assertEqual(self._merged(self._win(90, junk),
+                                          self._win(3, 1782050340)), 3, junk)
+            self.assertEqual(self._merged(self._win(3, 1782050340),
+                                          self._win(90, junk)), 3, junk)
+
+    def test_two_unidentified_windows_keep_the_max(self):
+        self.assertEqual(self._merged(self._win(90), self._win(12)), 90)
+
+    def test_bool_percentage_is_not_a_valid_window(self):
+        stamp = 1782050340
+        self.assertEqual(self._merged(self._win(True, stamp),
+                                      self._win(7, stamp)), 7)
+        self.assertEqual(self._merged(self._win(7, stamp),
+                                      self._win(True, stamp)), 7)
+        # Bool on both sides is no window at all, so nothing is stored.
+        self.assertEqual(core._merge_caps(self._win(True, stamp),
+                                          self._win(False, stamp)), {})
 
 
 class ProviderScopeTests(unittest.TestCase):
@@ -519,6 +682,7 @@ class ProviderScopeTests(unittest.TestCase):
         self.assertIn("qwen3.8-max", line)
         self.assertIn("ctx 16%", line)
         self.assertNotIn("wk", line)  # the whole point: no borrowed number
+        self.assertNotIn("5h", line)  # and the session window is no different
 
     def test_same_provider_fallback_still_works(self):
         # The cross-window fallback is the feature; only cross-PROVIDER is wrong.
@@ -600,6 +764,7 @@ class ProviderScopeTests(unittest.TestCase):
             line = self._run({"model": {"display_name": "B"},
                               "context_window": {"used_percentage": 5}})
         self.assertNotIn("wk", line)
+        self.assertNotIn("5h", line)
 
     def test_explicit_path_cannot_bypass_provider_isolation(self):
         # [P2] read_snapshot(SNAPSHOT_PATH) reached the default account's file
@@ -673,6 +838,7 @@ class ProviderScopeTests(unittest.TestCase):
             line = self._run({"model": {"display_name": "two"},
                               "context_window": {"used_percentage": 4}})
         self.assertNotIn("wk", line)
+        self.assertNotIn("5h", line)
 
     def test_persisted_fields_are_exactly_the_documented_set(self):
         with self._env(None):
@@ -743,6 +909,7 @@ class ProviderScopeTests(unittest.TestCase):
             line = self._run({"model": {"display_name": "other"},
                               "context_window": {"used_percentage": 5}})
         self.assertNotIn("wk", line)
+        self.assertNotIn("5h", line)
 
     # --- codex review round 3 --------------------------------------------
     def test_query_secret_never_reaches_disk(self):

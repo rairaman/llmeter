@@ -287,6 +287,20 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     return snap
 
 
+def _cap_pct(win):
+    """A cap window's used_percentage, or None if the window is unusable.
+
+    bool is excluded deliberately: JSON true is not 1%, and isinstance(True,
+    int) would otherwise let it render and win a merge. One guard shared by
+    the merge and the render path, so both agree on what a window even is."""
+    if not isinstance(win, dict):
+        return None
+    pct = win.get("used_percentage")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    return pct
+
+
 def _merge_caps(prev_caps, new_caps):
     """Merge cap windows so the snapshot is the account-level truth, not the
     last writer's view. Idle CLI sessions re-publish their LAST-KNOWN caps on
@@ -295,34 +309,35 @@ def _merge_caps(prev_caps, new_caps):
     last-writer-wins made the meter flap (69->82->69 within a minute, seen
     live 2026-07-06). Per window: a later resets_at is a newer window and wins
     outright; the SAME resets_at means the same window, where the account
-    percentage is monotonically non-decreasing -> keep the max."""
+    percentage is monotonically non-decreasing -> keep the max.
+
+    Which window a reading belongs to is decided by the PARSED instant, not by
+    the wire type. Comparing types instead let two ISO resets_at values fall
+    through to max-wins (a meter frozen at its high-water mark) and, in the
+    mixed case, handed the win to whichever side happened to be numeric. A
+    weekly window hides both; a 5-hour window rolls five times a day."""
     prev_caps = prev_caps if isinstance(prev_caps, dict) else {}
     new_caps = new_caps if isinstance(new_caps, dict) else {}
     merged = {}
     for w in set(prev_caps) | set(new_caps):
         old_w, new_w = prev_caps.get(w), new_caps.get(w)
-        old_ok = isinstance(old_w, dict) and isinstance(
-            old_w.get("used_percentage"), (int, float))
-        new_ok = isinstance(new_w, dict) and isinstance(
-            new_w.get("used_percentage"), (int, float))
-        if not old_ok and not new_ok:
+        old_pct, new_pct = _cap_pct(old_w), _cap_pct(new_w)
+        if old_pct is None and new_pct is None:
             continue  # neither side is a valid window: store nothing
-        if not old_ok or not new_ok:
-            merged[w] = new_w if new_ok else old_w
+        if old_pct is None or new_pct is None:
+            merged[w] = new_w if new_pct is not None else old_w
             continue
-        old_r, new_r = old_w.get("resets_at"), new_w.get("resets_at")
-        old_num = isinstance(old_r, (int, float))
-        new_num = isinstance(new_r, (int, float))
-        if old_num and new_num and old_r != new_r:
+        old_r = _reset_epoch(old_w.get("resets_at"))
+        new_r = _reset_epoch(new_w.get("resets_at"))
+        if old_r is not None and new_r is not None and old_r != new_r:
             merged[w] = new_w if new_r > old_r else old_w
-        elif old_num != new_num:
+        elif (old_r is None) != (new_r is None):
             # Only one side is window-identified: it wins — otherwise a
             # legacy/hostile entry with no resets_at but a higher % would
             # block every future window forever (deepseek review).
-            merged[w] = new_w if new_num else old_w
+            merged[w] = new_w if new_r is not None else old_w
         else:
-            merged[w] = new_w if (new_w["used_percentage"]
-                                  >= old_w["used_percentage"]) else old_w
+            merged[w] = new_w if new_pct >= old_pct else old_w
     return merged
 
 
@@ -380,15 +395,38 @@ def read_snapshot(path=None, max_age_secs=6 * 3600, provider=None):
     return snap
 
 
-def fmt_reset(epoch):
-    """'Tue 10:00' from a resets_at value (epoch seconds or ISO string)."""
+def _reset_epoch(value):
+    """Epoch seconds for a resets_at value, or None if it names no instant.
+
+    The host sends either epoch seconds or an ISO 8601 string, and the two
+    forms can name the SAME instant — so everything that has to know *which*
+    window a reading belongs to (display and the merge alike) compares the
+    parsed instant, never the wire type. A bool is JSON true/false, never a
+    timestamp; isinstance(True, int) would otherwise make it epoch 1.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
     try:
-        if isinstance(epoch, (int, float)):
-            dt = datetime.datetime.fromtimestamp(epoch)
-        else:
-            dt = datetime.datetime.fromisoformat(str(epoch)).astimezone()
-        return dt.strftime("%a %H:%M")
+        return datetime.datetime.fromisoformat(str(value)).astimezone().timestamp()
     except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+def fmt_reset(value, fmt="%a %H:%M"):
+    """'Tue 10:00' from a resets_at value (epoch seconds or ISO string).
+
+    ``fmt`` sets the granularity. The weekly reset can be days out so it needs
+    the weekday; the 5-hour one always lands today, where the clock time alone
+    is unambiguous and shorter. The default keeps every existing caller's
+    output byte for byte."""
+    epoch = _reset_epoch(value)
+    if epoch is None:
+        return "?"
+    try:
+        return datetime.datetime.fromtimestamp(epoch).strftime(fmt)
+    except (ValueError, OSError, OverflowError):
         return "?"
 
 
@@ -404,14 +442,18 @@ def fmt_tokens(n):
 
 
 def format_line(reading, snap=None):
-    """The visible status line: model · ctx N% (tokens/window) · wk N% (reset)
-    [· $cost].
+    """The visible status line: model · ctx N% (tokens/window) · 5h N% (reset)
+    · wk N% (reset) [· $cost].
 
     ``reading`` is this message's live reading (model + context + maybe caps).
     ``snap`` is the freshest persisted snapshot — used only to fill the
     account-level cap when THIS message's payload lacks it (a fresh window
     before its first API response). Falls back to a bare "llmeter" so the host
     tool's prompt never shows an empty or broken line.
+
+    Every segment is rendered only when its data is actually present, which is
+    what keeps a non-Claude session unchanged: those payloads carry no
+    ``rate_limits`` at all, so neither cap window can appear.
     """
     reading = reading if isinstance(reading, dict) else {}
     parts = []
@@ -438,11 +480,17 @@ def format_line(reading, snap=None):
     caps = reading.get("caps")
     if not (isinstance(caps, dict) and caps):
         caps = dget(snap or {}, "caps")
-    week = caps.get("seven_day") if isinstance(caps, dict) else None
-    week = week if isinstance(week, dict) else {}
-    if isinstance(week.get("used_percentage"), (int, float)):
-        parts.append("wk {:.0f}% (resets {})".format(
-            week["used_percentage"], fmt_reset(week.get("resets_at"))))
+    # Shortest window first, so the number you are most likely to hit next is
+    # the one nearer the model name. The weekly reset can be days out and needs
+    # its weekday; the 5-hour one always lands today, so the clock time is
+    # enough and keeps the line short.
+    for window, label, fmt in (("five_hour", "5h", "%H:%M"),
+                               ("seven_day", "wk", "%a %H:%M")):
+        win = caps.get(window) if isinstance(caps, dict) else None
+        pct = _cap_pct(win)
+        if pct is not None:
+            parts.append("{} {:.0f}% (resets {})".format(
+                label, pct, fmt_reset(win.get("resets_at"), fmt)))
 
     # Pay-per-token tools surface cost instead of a cap.
     cost = reading.get("cost")
