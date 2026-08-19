@@ -270,14 +270,64 @@ class RenderTests(unittest.TestCase):
     def test_format_line_shows_the_five_hour_window(self):
         # The session limit is the one you actually hit mid-afternoon, and
         # Claude Code has always sent it — only the render dropped it.
-        line = core.format_line(claude_code.parse(PAYLOAD))
-        clock = datetime.datetime.fromtimestamp(1782050340).strftime("%H:%M")
-        # Whole-segment equality, so a stray weekday fails: a 5-hour reset
-        # always lands today and the clock time alone says it.
-        self.assertEqual(_segment(line, "5h"),
-                         "5h 22% (resets {})".format(clock))
+        # A reset later today is the common case, and there the clock time
+        # alone says everything. Whole-segment equality, so a redundant
+        # weekday would fail.
+        noon = (datetime.datetime.combine(datetime.date.today(),
+                                          datetime.time())
+                + datetime.timedelta(hours=12)).timestamp()
+        payload = json.loads(json.dumps(PAYLOAD))
+        payload["rate_limits"]["five_hour"]["resets_at"] = noon
+        line = core.format_line(claude_code.parse(payload))
+        self.assertEqual(_segment(line, "5h"), "5h 22% (resets 12:00)")
         self.assertLess(line.index("ctx"), line.index("5h"))
         self.assertLess(line.index("5h"), line.index("wk"))
+
+    def test_five_hour_reset_after_midnight_keeps_its_weekday(self):
+        # A 5-hour window opened in the evening resets TOMORROW: 33.8% of
+        # 29,166 captured history rows have a five_hour reset on a different
+        # local date than the capture (real row: Tue 20:02 -> resets Wed 01:00).
+        # A bare "01:00" there reads as a time this morning that already went.
+        # Anchored to local midnight so the expectation holds whatever the
+        # clock says when the suite runs.
+        midnight = datetime.datetime.combine(datetime.date.today(),
+                                             datetime.time())
+        today = (midnight + datetime.timedelta(hours=12)).timestamp()
+        tomorrow = (midnight + datetime.timedelta(hours=36)).timestamp()
+
+        line = core.format_line(
+            {"caps": {"five_hour": {"used_percentage": 31, "resets_at": today}}})
+        self.assertEqual(_segment(line, "5h"), "5h 31% (resets 12:00)")
+
+        line = core.format_line(
+            {"caps": {"five_hour": {"used_percentage": 0,
+                                    "resets_at": tomorrow}}})
+        weekday = datetime.datetime.fromtimestamp(tomorrow).strftime("%a")
+        self.assertEqual(_segment(line, "5h"),
+                         "5h 0% (resets {} 12:00)".format(weekday))
+
+    def test_fmt_reset_soon_marks_only_a_different_day(self):
+        midnight = datetime.datetime.combine(datetime.date.today(),
+                                             datetime.time())
+        for hours, want_weekday in ((1, False), (12, False), (23.5, False),
+                                    (36, True), (-12, True)):
+            stamp = (midnight + datetime.timedelta(hours=hours)).timestamp()
+            got = core.fmt_reset_soon(stamp)
+            # "12:00" for today, "Wed 12:00" otherwise: the space is the tell.
+            self.assertEqual(" " in got, want_weekday, (hours, got))
+        for bad in (True, None, "soon", []):
+            self.assertEqual(core.fmt_reset_soon(bad), "?", bad)
+
+    def test_weekly_reset_always_keeps_its_weekday(self):
+        # The weekly line is untouched: its reset is days out, so the weekday
+        # is never redundant even when it happens to land today.
+        noon = datetime.datetime.combine(
+            datetime.date.today(), datetime.time()) + datetime.timedelta(hours=12)
+        line = core.format_line(
+            {"caps": {"seven_day": {"used_percentage": 37,
+                                    "resets_at": noon.timestamp()}}})
+        self.assertEqual(_segment(line, "wk"),
+                         "wk 37% (resets {} 12:00)".format(noon.strftime("%a")))
 
     def test_format_line_renders_each_window_on_its_own(self):
         five = core.format_line(

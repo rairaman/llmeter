@@ -20,7 +20,8 @@ Show the rolling 5-hour session window (used % plus reset clock time) in the Cla
 
 ## User journey
 
-- Claude subscription session: `Fable 5 · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)`. The 5h segment sits before wk, uses absolute local `%H:%M` (no weekday), and is always shown when the data exists (no config or env toggle).
+- Claude subscription session: `Fable 5 · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)`. The 5h segment sits before wk, uses absolute local `%H:%M`, and is always shown when the data exists (no config or env toggle).
+- Evening session whose 5-hour window resets after midnight: `5h 0% (resets Thu 01:00)`. The weekday is dropped only when the reset lands on today's local date. Verification against 29,166 real history rows found this is 33.8% of five_hour readings, not an edge case, and a bare `01:00` at 8pm reads as a time that already passed.
 - Fresh pane before the first API response: the payload lacks caps, so the existing cross-window snapshot fallback fills them; 5h rides along automatically.
 - Vendor session: unchanged, e.g. `kimi-k3 · ctx 4% (40k/1M) · $0.06`. No 5h, no wk.
 - Missing reset time: `5h 22% (resets ?)`, matching wk behaviour today.
@@ -29,7 +30,7 @@ Show the rolling 5-hour session window (used % plus reset clock time) in the Cla
 ## Acceptance criteria
 
 1. `python3 -m unittest discover -s tests` passes with zero failures or errors.
-2. Formatting the standard test payload yields a line containing `5h 22% (resets HH:MM)` where HH:MM is the local `%H:%M` of epoch 1782050340, with no weekday in the 5h segment, placed after ctx and before wk.
+2. A five_hour window resetting later today renders `5h N% (resets HH:MM)` with no weekday, placed after ctx and before wk; one resetting on any other local date keeps its weekday (`5h N% (resets Thu HH:MM)`). The weekly segment always keeps its weekday, unchanged.
 3. The exact vendor line assertion at `tests/test_llmeter.py:116` (`kimi-k3 · ctx 4% (40k/1M) · $0.06`) passes byte for byte, and end-to-end vendor and gateway lines contain neither `wk` nor `5h`.
 4. Merging two ISO-identified windows keeps the later one even at a lower percentage (no ratchet); an epoch and its equivalent ISO instant merge as the same window (max wins); a later ISO beats an earlier epoch.
 5. A window with missing, junk or bool `resets_at` loses to any identified window regardless of percentage; two unidentified windows keep the max percentage.
@@ -45,7 +46,8 @@ All behaviour changes live in `llmeter/core.py`. No changes to `llmeter/statusli
 2. `fmt_reset(value, fmt="%a %H:%M")`: parses via `_reset_epoch`, renders local time via `fromtimestamp(...).strftime(fmt)`. The default argument keeps every existing call site and rendered string unchanged. One deliberate delta: `fmt_reset(True)` previously rendered epoch 1 as a real time, now returns `?` (covered by a test).
 3. New `_cap_pct(win)` guard: returns `used_percentage` from a window dict, or `None`, excluding bool. Used by both merge and render, closing the bool holes at `core.py:305-307` and `:443`.
 4. Merge fix in `_merge_caps`: window identity comes from `_reset_epoch` on both sides instead of a numeric-type check. Later reset wins outright; equal reset (including an epoch vs its equivalent ISO) keeps the max percentage; an identified window beats an unidentified one regardless of percentage; two unidentified windows keep the max. All six existing MergeCapsTests pass unchanged by inspection. Docstring updated to say identity is parsed, not type gated.
-5. Render: replace the single seven_day block at `core.py:441-445` with a small loop over `(("five_hour", "5h", "%H:%M"), ("seven_day", "wk", "%a %H:%M"))`, appending `"{label} {pct:.0f}% (resets {time})"` when `_cap_pct` is valid. Part order becomes model · ctx · 5h · wk · $. `format_line` docstring updated.
+5. Render: replace the single seven_day block at `core.py:441-445` with a small loop over `(("five_hour", "5h", fmt_reset_soon), ("seven_day", "wk", fmt_reset))`, appending `"{label} {pct:.0f}% (resets {time})"` when `_cap_pct` is valid. Part order becomes model · ctx · 5h · wk · $. `format_line` docstring updated.
+6. `fmt_reset_soon(value)` for the 5-hour window: clock time when the reset lands on today's local date, weekday-qualified otherwise. Added during verification, see below.
 
 Kept semantics, stated explicitly: `format_line` prefers the message's own caps wholesale over the snapshot (`core.py:438-440`). A payload carrying only `five_hour` renders 5h without wk even when the snapshot knows wk. Per-window fallback would be scope creep and is not part of this change.
 
@@ -95,10 +97,18 @@ Manual verification: pipe a captured payload through the real entry point, `PYTH
 
 ### Build notes (what actually landed)
 
-- The bool guard turned out to be a live defect, not just a latent one: before `_cap_pct`, `{"seven_day": {"used_percentage": True}}` rendered `wk 1% (resets ?)`. The hostile-shape test covers both windows for that reason.
 - `test_stale_republish_appends_no_history` leaked an open file handle and emitted a `ResourceWarning` once the suite grew. Switched to the file's existing `_lines` helper so the run stays pristine.
 - The README needed more than the four listed lines: every place that described a weekly-only meter (why-it-exists, multi-window safety, the vendor section, requirements) now names both windows. Still the same four files overall.
-- Verified on Python 3.9.6 and 3.14.0, 87 tests, and end to end through `llmeter.statusline` for the Claude, rollover and vendor cases.
+
+### Verification against real data (29,166 history rows, 45 days)
+
+Checked the live `~/.claude/llmeter/` capture rather than fixtures alone. Three findings, one of them a bug in this change.
+
+- **Bug found and fixed: the 5-hour reset does not always land today.** 33.8% of real five_hour readings have a reset on a different local date than the capture (real row: captured Tue 20:02, resets Wed 01:00). The original design dropped the weekday unconditionally, so an evening session showed `5h 0% (resets 01:00)`, reading as a time 19 hours past. Fixed with `fmt_reset_soon`, which keeps the weekday whenever the reset is not on today's local date.
+- **Correction to the two hardening claims.** `resets_at` is an epoch int in 100% of 29,166 rows and `used_percentage` is only ever int or float in 58,338 readings. So both the ISO merge ratchet and the bool `wk 1%` hole are **latent, not live**: the old numeric-vs-numeric branch handled real epoch data correctly. Both fixes are still right (core documents ISO as a valid wire form) but neither was biting production.
+- **The meter does not flap and the rollover already worked.** Zero same-window percentage decreases across 1,064 August rows, versus 4,110 five_hour decreases during the pre-fix July era. Real rollovers step cleanly: Tue 14:40 -> Tue 19:40 -> Wed 01:00 -> Wed 14:20, resetting to 0% each time. Real float artifacts (`7.000000000000001`, `28.999999999999996`) render correctly as `7%` and `29%`.
+
+Verified on Python 3.9.6 and 3.14.0, 90 tests, and end to end through the real `llmeter-statusline.sh` wrapper (exit 0, empty stderr) for the Claude, same-day, cross-midnight, vendor and gateway cases.
 
 ## Custodian UI/UX checklist
 

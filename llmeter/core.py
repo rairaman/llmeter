@@ -430,6 +430,26 @@ def fmt_reset(value, fmt="%a %H:%M"):
         return "?"
 
 
+def fmt_reset_soon(value):
+    """A reset for an hours-long window: the clock time when it lands today,
+    weekday-qualified when it does not.
+
+    A 5-hour window opened in the evening resets after midnight — 33.8% of
+    29,166 captured history rows have a five_hour reset on a different local
+    date than the capture (real row: Tue 20:02 -> resets Wed 01:00). A bare
+    "01:00" there reads as a time this morning that has already gone, so the
+    weekday is only dropped when it genuinely says nothing."""
+    epoch = _reset_epoch(value)
+    if epoch is None:
+        return "?"
+    try:
+        lands_on = datetime.datetime.fromtimestamp(epoch).date()
+        today = datetime.date.today()
+    except (ValueError, OSError, OverflowError):
+        return "?"
+    return fmt_reset(value, "%H:%M" if lands_on == today else "%a %H:%M")
+
+
 def fmt_tokens(n):
     """Compact token count: 618 · 9.5k · 206k · 1M."""
     if n >= 1_000_000:
@@ -481,16 +501,16 @@ def format_line(reading, snap=None):
     if not (isinstance(caps, dict) and caps):
         caps = dget(snap or {}, "caps")
     # Shortest window first, so the number you are most likely to hit next is
-    # the one nearer the model name. The weekly reset can be days out and needs
-    # its weekday; the 5-hour one always lands today, so the clock time is
-    # enough and keeps the line short.
-    for window, label, fmt in (("five_hour", "5h", "%H:%M"),
-                               ("seven_day", "wk", "%a %H:%M")):
+    # the one nearer the model name. The weekly reset is days out and always
+    # carries its weekday; the 5-hour one usually lands today, where the clock
+    # time alone is shorter and says the same thing.
+    for window, label, show_reset in (("five_hour", "5h", fmt_reset_soon),
+                                      ("seven_day", "wk", fmt_reset)):
         win = caps.get(window) if isinstance(caps, dict) else None
         pct = _cap_pct(win)
         if pct is not None:
             parts.append("{} {:.0f}% (resets {})".format(
-                label, pct, fmt_reset(win.get("resets_at"), fmt)))
+                label, pct, show_reset(win.get("resets_at"))))
 
     # Pay-per-token tools surface cost instead of a cap.
     cost = reading.get("cost")
