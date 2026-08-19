@@ -479,7 +479,11 @@ def format_line(reading, snap=None):
     parts = []
     model = reading.get("model")
     if isinstance(model, str) and model:
-        parts.append(model)
+        # "Opus 5 (1M context)" -> "Opus 5 (1M)". The window size is already
+        # spelled out in the ctx segment, so the word is 8 columns of nothing
+        # on a line that competes with the prompt for width. Display only: the
+        # snapshot keeps whatever the host actually reported.
+        parts.append(model.replace(" context)", ")"))
     ctx = reading.get("context_pct")
     ctx_part = "ctx {:.0f}%".format(ctx) if isinstance(ctx, (int, float)) else None
     # Absolute tokens ride along when the adapter surfaced them; 0 means "no

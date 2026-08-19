@@ -98,6 +98,7 @@ Manual verification: pipe a captured payload through the real entry point, `PYTH
 ### Build notes (what actually landed)
 
 - `test_stale_republish_appends_no_history` leaked an open file handle and emitted a `ResourceWarning` once the suite grew. Switched to the file's existing `_lines` helper so the run stays pristine.
+- The rendered model name trims `(1M context)` to `(1M)`, on request, to claw back 8 columns of the width the new segment costs. Render only: `write_snapshot` still persists the host's own string, and the window size is already carried structurally in `context_window_size` and shown in the ctx segment.
 - The README needed more than the four listed lines: every place that described a weekly-only meter (why-it-exists, multi-window safety, the vendor section, requirements) now names both windows. Still the same four files overall.
 
 ### Verification against real data (29,166 history rows, 45 days)

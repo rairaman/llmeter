@@ -220,6 +220,13 @@ class HarvestTests(unittest.TestCase):
         self.assertEqual(on_disk["source"], "claude-code")
         self.assertEqual(len(_lines(self.hist)), 1)
 
+    def test_snapshot_keeps_the_untrimmed_model_name(self):
+        # Trimming "(1M context)" is a display concern only: what reaches disk
+        # stays exactly what the host reported, so a later consumer is not
+        # reading llmeter's abbreviations back as fact.
+        self._write(dict(PAYLOAD, model={"display_name": "Opus 5 (1M context)"}))
+        self.assertEqual(_json(self.snap)["model"], "Opus 5 (1M context)")
+
     def test_history_appends_only_on_change(self):
         self._write(PAYLOAD)
         self._write(PAYLOAD)  # identical caps -> no new history line
@@ -357,6 +364,19 @@ class RenderTests(unittest.TestCase):
                      {"seven_day": {"used_percentage": True}}):
             self.assertEqual(
                 core.format_line({"model": "M", "caps": caps}), "M", caps)
+
+    def test_format_line_trims_the_context_words_from_the_model(self):
+        # Claude Code reports names like "Opus 5 (1M context)", but the window
+        # size is already spelled out in the ctx segment, so the word is dead
+        # columns on a line that has to fit a terminal.
+        self.assertEqual(
+            core.format_line({"model": "Opus 5 (1M context)",
+                              "context_pct": 30}),
+            "Opus 5 (1M) · ctx 30%")
+        self.assertEqual(core.format_line({"model": "Sonnet 5 (200k context)"}),
+                         "Sonnet 5 (200k)")
+        # A name with no such suffix is left exactly alone.
+        self.assertEqual(core.format_line({"model": "kimi-k3"}), "kimi-k3")
 
     def test_format_line_absolute_tokens(self):
         payload = {"model": {"display_name": "Fable 5"},

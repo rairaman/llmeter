@@ -3,7 +3,7 @@
 An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, and **how much of your session and weekly limits you've burned**:
 
 ```
-Opus 4.8 (1M context) · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)
+Opus 4.8 (1M) · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)
 ```
 
 `5h` is the rolling 5-hour session window (the one you hit mid-afternoon) and `wk` the weekly plan. The 5-hour reset shows the clock time alone when it lands today, and keeps its weekday when it doesn't — a window opened in the evening resets after midnight, so a bare `01:00` would read as a time that has already gone.
