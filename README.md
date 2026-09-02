@@ -1,10 +1,12 @@
 # llmeter
 
-An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, and **how much of your weekly plan you've burned**:
+An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, and **how much of your session and weekly limits you've burned**:
 
 ```
-Opus 4.8 (1M context) · ctx 30% (295k/1M) · wk 37% (resets Tue 10:00)
+Opus 4.8 (1M) · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)
 ```
+
+`5h` is the rolling 5-hour session window (the one you hit mid-afternoon) and `wk` the weekly plan. The 5-hour reset shows the clock time alone when it lands today, and keeps its weekday when it doesn't — a window opened in the evening resets after midnight, so a bare `01:00` would read as a time that has already gone.
 
 It costs **zero tokens, zero network, ~20 ms** per message, and it quietly saves the real usage numbers to disk so you can chart them later.
 
@@ -14,9 +16,9 @@ It costs **zero tokens, zero network, ~20 ms** per message, and it quietly saves
 
 ## Why it exists
 
-Claude Code already knows your real weekly-cap % — the same number the `/usage` panel shows — and it hands that number to your **status line** on every message. But if you don't have a status line configured, it's **discarded**: it's not in the transcripts, not on disk, nowhere. The only way to see "am I about to hit my weekly wall?" is to stop and open `/usage`.
+Claude Code already knows your real cap percentages — both the 5-hour session window and the weekly one, the same numbers the `/usage` panel shows — and it hands them to your **status line** on every message. But if you don't have a status line configured, they're **discarded**: not in the transcripts, not on disk, nowhere. The only way to see "am I about to hit a wall?" is to stop and open `/usage`.
 
-llmeter stands in that status-line slot: it prints the number so it's always in view, and **tees it to disk** before it evaporates — turning a display-only blob into data you can actually track.
+llmeter stands in that status-line slot: it prints the numbers so they're always in view, and **tees them to disk** before they evaporate — turning a display-only blob into data you can actually track.
 
 ## Install
 
@@ -40,7 +42,7 @@ cat ~/.claude/llmeter/usage-snapshot.json
 
 You should see a recent snapshot with `caps` populated.
 
-- The `wk N%` field appears only **after the first API response of a session**, and only for **Pro/Max** accounts (that's when Claude Code includes the rate-limit data). A brand-new window shows the account-level cap from the freshest capture any window made.
+- The `5h N%` and `wk N%` fields appear only **after the first API response of a session**, and only for **Pro/Max** accounts (that's when Claude Code includes the rate-limit data). A brand-new window shows the account-level caps from the freshest capture any window made.
 
 ## How it works
 
@@ -58,7 +60,7 @@ every message  ·  + every 60s
 
 - **Private & local.** Everything happens inside the Claude Code process on your machine. No network, no credentials, no telemetry. The two files under `~/.claude/llmeter/` never leave your disk.
 - **Fail-soft.** If Claude Code ever changes the payload shape, llmeter still prints a line and never breaks your prompt (locked by the test suite).
-- **Multi-window safe.** Run many Claude Code panes at once — the snapshot write is atomic and the weekly cap is account-level, so they cooperate rather than collide.
+- **Multi-window safe.** Run many Claude Code panes at once — the snapshot write is atomic and both caps are account-level, so they cooperate rather than collide.
 
 Terminal-independent: works identically under Terminal.app, iTerm2, tmux, VS Code's terminal, or SSH — the terminal is not on the data path.
 
@@ -81,12 +83,12 @@ is spending a **different account's** quota. llmeter keeps each provider's
 usage in its own file and never lets one stand in for another.
 
 The visible effect: such a session shows **`model · ctx% · $spend`** rather than
-`wk`. A cap borrowed from your Anthropic account and displayed under a
+`5h` and `wk`. A cap borrowed from your Anthropic account and displayed under a
 third-party model's name is a confident wrong number, and this tool exists to
 show you the real one.
 
-**There is no weekly % available for a vendor session, and it is not a gap
-llmeter can close.** Measured 2026-08-10 against Claude Code 2.1.226:
+**There is no cap % of either kind available for a vendor session, and it is
+not a gap llmeter can close.** Measured 2026-08-10 against Claude Code 2.1.226:
 
 - 58 consecutive status-line payloads captured from live Kimi and Qwen sessions
   carried **no `rate_limits` key at all**. Anthropic sessions carry it.
@@ -101,8 +103,8 @@ are your Claude plan's.
 
 So llmeter shows the usage signal that *is* real for a metered session — the
 running spend Claude Code reports in the payload. On the default provider,
-where `wk` is the meaningful number and a dollar figure would be noise, no
-spend is shown.
+where the cap percentages are the meaningful numbers and a dollar figure would
+be noise, no spend is shown.
 
 #### Working examples
 
@@ -179,7 +181,7 @@ It only removes the `statusLine` key if it points at llmeter — a status line y
 
 ## Requirements
 
-- **Claude Code** (v1). `wk %` needs a **Pro/Max** subscription.
+- **Claude Code** (v1). The `5h %` and `wk %` figures need a **Pro/Max** subscription.
 - **python3** and **zsh** — both ship with macOS (on Linux, install zsh; the command uses `/usr/bin/env zsh`). No pip installs, no dependencies (stdlib only).
 
 ## Roadmap — every AI CLI
